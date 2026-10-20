@@ -16,6 +16,7 @@ import pytorch_lightning as pl
 
 from src.utils.inout import save_json_bop23
 import src.model.scoring as scoring
+from src.model.inference_contract import InferenceField, ReferenceFile
 from src.model.utils import BatchedData, Detections, convert_npz_to_json
 
 from src.model.sam import CustomSamAutomaticMaskGenerator
@@ -117,7 +118,9 @@ class NOCTIS(pl.LightningModule):
 
         start_time = time.time()
 
-        descriptors_path = osp.join(self.ref_dataset.template_dir, "descriptors.pth")
+        descriptors_path = osp.join(
+            self.ref_dataset.template_dir, ReferenceFile.DESCRIPTORS.value
+        )
 
         if self.onboarding_config.rendering_type == "pbr":
             # stored in the 'template' dir, but are made from the (some) dataset images.
@@ -130,12 +133,14 @@ class NOCTIS(pl.LightningModule):
             # load embeddings
             all_ref_features = torch.load(descriptors_path)
             self.ref_data = {
-                "cls_descriptors": all_ref_features["cls_descriptors"].to(
+                InferenceField.CLASS_DESCRIPTORS.value: all_ref_features[
+                    InferenceField.CLASS_DESCRIPTORS
+                ].to(
                     self.storage_device
                 ),  # O x T x cF
-                "patch_descriptors": all_ref_features["patch_descriptors"].to(
-                    self.storage_device
-                ),
+                InferenceField.PATCH_DESCRIPTORS.value: all_ref_features[
+                    InferenceField.PATCH_DESCRIPTORS
+                ].to(self.storage_device),
             }  # O x T x (P*P) x pF
             logging.info(
                 "Loaded descriptors from (cached) file <{}>.".format(descriptors_path)
@@ -143,25 +148,29 @@ class NOCTIS(pl.LightningModule):
         else:
             # create descriptors/embeddings of all template images
             self.ref_data = {
-                "cls_descriptors": BatchedData(None),
-                "patch_descriptors": BatchedData(None),
+                InferenceField.CLASS_DESCRIPTORS.value: BatchedData(None),
+                InferenceField.PATCH_DESCRIPTORS.value: BatchedData(None),
             }
 
             for idx in tqdm(
                 range(len(self.ref_dataset)), desc="Computing descriptors ..."
             ):
                 ref_data = self.ref_dataset[idx]
-                ref_images = ref_data["templates"].to(self.device)  # T x C x S x S
-                ref_masks = ref_data["template_masks"].to(self.device)  # T x S x S
+                ref_images = ref_data[InferenceField.TEMPLATES].to(
+                    self.device
+                )  # T x C x S x S
+                ref_masks = ref_data[InferenceField.TEMPLATE_MASKS].to(
+                    self.device
+                )  # T x S x S
 
                 ref_features = self.descriptor_model.compute_cls_and_patch_features(
                     processed_rgbs=ref_images, masks=ref_masks
                 )
 
-                self.ref_data["cls_descriptors"].append(
+                self.ref_data[InferenceField.CLASS_DESCRIPTORS].append(
                     ref_features[0].to(self.storage_device)
                 )  # T x cF
-                self.ref_data["patch_descriptors"].append(
+                self.ref_data[InferenceField.PATCH_DESCRIPTORS].append(
                     ref_features[1].to(self.storage_device)
                 )  # T x (P*P) x pF
 
@@ -171,10 +180,16 @@ class NOCTIS(pl.LightningModule):
                 del ref_features
                 torch.cuda.empty_cache()
 
-            self.ref_data["cls_descriptors"].stack()  # O x T x cF
-            self.ref_data["cls_descriptors"] = self.ref_data["cls_descriptors"].data
-            self.ref_data["patch_descriptors"].stack()  # O x T x (P*P) x pF
-            self.ref_data["patch_descriptors"] = self.ref_data["patch_descriptors"].data
+            self.ref_data[InferenceField.CLASS_DESCRIPTORS].stack()  # O x T x cF
+            self.ref_data[InferenceField.CLASS_DESCRIPTORS] = self.ref_data[
+                InferenceField.CLASS_DESCRIPTORS
+            ].data
+            self.ref_data[
+                InferenceField.PATCH_DESCRIPTORS
+            ].stack()  # O x T x (P*P) x pF
+            self.ref_data[InferenceField.PATCH_DESCRIPTORS] = self.ref_data[
+                InferenceField.PATCH_DESCRIPTORS
+            ].data
 
             # save the precomputed features for future use
             torch.save(self.ref_data, descriptors_path)
@@ -188,8 +203,8 @@ class NOCTIS(pl.LightningModule):
             ).format(
                 onboarding_time,
                 onboarding_time / num_objects,
-                self.ref_data["cls_descriptors"].shape[1:],
-                self.ref_data["patch_descriptors"].shape[1:],
+                self.ref_data[InferenceField.CLASS_DESCRIPTORS].shape[1:],
+                self.ref_data[InferenceField.PATCH_DESCRIPTORS].shape[1:],
             )
         )
 
@@ -361,7 +376,7 @@ class NOCTIS(pl.LightningModule):
         # compute semantic matching scores for each proposal
         scores = scoring.compute_semantic_similarity(
             query_cls_descriptors,
-            self.ref_data["cls_descriptors"],
+            self.ref_data[InferenceField.CLASS_DESCRIPTORS],
             self.matching_config.semantic_confidence_threshold,
         )  # B x O x T
 
@@ -383,7 +398,7 @@ class NOCTIS(pl.LightningModule):
         # compute appearance matching scores for each proposal
         scores = scoring.compute_appearance_similarity(
             query_patch_descriptors,
-            self.ref_data["patch_descriptors"],
+            self.ref_data[InferenceField.PATCH_DESCRIPTORS],
             self.matching_config.appearance_confidence_threshold,
             self.matching_config.appearance_cycle_threshold,
         )  # B x O x T
@@ -408,14 +423,14 @@ class NOCTIS(pl.LightningModule):
         Recognize one observation independently of its source frame number.
         """
         self.initialize()
-        assert batch["image"].shape[0] == 1, "Batch size must be 1"
+        assert batch[InferenceField.IMAGE].shape[0] == 1, "Batch size must be 1"
 
         if self.skip_inference:
-            return
+            return None
 
         # inverse transform back to normal image
         image_np = (
-            self.inv_rgb_transform(batch["image"][0])
+            self.inv_rgb_transform(batch[InferenceField.IMAGE][0])
             .detach()
             .cpu()
             .numpy()
@@ -429,9 +444,19 @@ class NOCTIS(pl.LightningModule):
             image_np
         )  # {'boxes': B x 4 (as xyxy), 'masks': B x H x W}
 
+        if proposals is None:
+            proposals = {
+                InferenceField.BOXES: torch.empty(
+                    (0, 4), dtype=torch.long, device=self.device
+                ),
+                InferenceField.MASKS: torch.empty(
+                    (0, *image_np.shape[:2]), device=self.device
+                ),
+            }
+
         torch.cuda.empty_cache()  # clean up cache
 
-        logging.info("Made {} detections".format(len(proposals["boxes"])))
+        logging.info("Made {} detections".format(len(proposals[InferenceField.BOXES])))
 
         # init detections with masks and boxes
         detections = Detections(proposals)
@@ -441,14 +466,14 @@ class NOCTIS(pl.LightningModule):
 
         if len(detections) == 0:
             detections.add_attribute(
-                "scores", torch.empty(0, device=detections.boxes.device)
+                InferenceField.SCORES, torch.empty(0, device=detections.boxes.device)
             )
             detections.add_attribute(
-                "object_ids",
+                InferenceField.OBJECT_IDENTITIES,
                 torch.empty(0, dtype=torch.long, device=detections.boxes.device),
             )
             detections.add_attribute(
-                "score_distribution",
+                InferenceField.SCORE_DISTRIBUTION,
                 torch.empty((0, len(self.ref_dataset)), device=detections.boxes.device),
             )
             return self._complete_inference(
@@ -500,10 +525,10 @@ class NOCTIS(pl.LightningModule):
                 final_score.shape[0], dtype=final_score.dtype, device=final_score.device
             )  # B
             num_conf_factors = 0
-            if hasattr(detections, "boxes_scores"):
+            if hasattr(detections, InferenceField.BOX_CONFIDENCE):
                 conf += detections.boxes_scores  # B
                 num_conf_factors += 1
-            if hasattr(detections, "masks_scores"):
+            if hasattr(detections, InferenceField.MASK_CONFIDENCE):
                 conf += detections.masks_scores  # B
                 num_conf_factors += 1
             conf /= num_conf_factors  # B
@@ -525,9 +550,11 @@ class NOCTIS(pl.LightningModule):
         )
 
         detections.filter(selected_proposal_indices)
-        detections.add_attribute("scores", pred_scores)
-        detections.add_attribute("score_distribution", pred_score_distribution)
-        detections.add_attribute("object_ids", pred_object_indices)
+        detections.add_attribute(InferenceField.SCORES, pred_scores)
+        detections.add_attribute(
+            InferenceField.SCORE_DISTRIBUTION, pred_score_distribution
+        )
+        detections.add_attribute(InferenceField.OBJECT_IDENTITIES, pred_object_indices)
         detections.apply_nms_per_object_id(self.post_processing_config.nms_threshold)
         detections.keep_best_per_object_id()
         matching_stage_end_time = time.time()
@@ -561,14 +588,14 @@ class NOCTIS(pl.LightningModule):
 
         if self.return_detections:
             return {
-                "detections": detections,
-                "runtime_proposal_stage": proposal_runtime,
-                "runtime_matching_stage": matching_runtime,
+                InferenceField.DETECTIONS: detections,
+                InferenceField.PROPOSAL_RUNTIME: proposal_runtime,
+                InferenceField.MATCHING_RUNTIME: matching_runtime,
             }
         else:
             # store detection as 'npz.' file
-            scene_id = batch["scene_id"][0]
-            frame_id = batch["frame_id"][0]
+            scene_id = batch[InferenceField.SCENE_IDENTITY][0]
+            frame_id = batch[InferenceField.FRAME_IDENTITY][0]
 
             # save detections to file
             save_dir = osp.join(
